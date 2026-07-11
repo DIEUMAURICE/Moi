@@ -511,7 +511,10 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=None
         )
         game["awaiting_number"] = True
-        context.user_data["roulette_numero"] = {"user_id": user_id, "amount": amount, "game_key": game_key}
+        # On utilise le contexte utilisateur pour savoir qu'on attend un numéro pour ce joueur
+        context.user_data["roulette_awaiting"] = True
+        context.user_data["roulette_game_key"] = game_key
+        context.user_data["roulette_amount"] = amount
 
     elif action == "roulette_spin":
         bet_type = game.get("bet_type")
@@ -569,11 +572,22 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def roulette_number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not context.user_data.get("roulette_numero"):
+
+    # Vérifier si on attend vraiment un numéro pour ce joueur
+    if not context.user_data.get("roulette_awaiting"):
         return
-    data = context.user_data["roulette_numero"]
-    if user.id != data["user_id"]:
+
+    game_key = context.user_data.get("roulette_game_key")
+    if not game_key:
         return
+
+    game = active_games.get(game_key)
+    if not game or game["user_id"] != user.id:
+        # Nettoyer le contexte si la partie est terminée
+        context.user_data.pop("roulette_awaiting", None)
+        context.user_data.pop("roulette_game_key", None)
+        return
+
     try:
         num = int(update.message.text.strip())
         if not (0 <= num <= 36):
@@ -582,13 +596,9 @@ async def roulette_number_input(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Numéro invalide. Envoie un nombre entre 0 et 36.")
         return
 
-    amount = data["amount"]
-    game_key = data["game_key"]
-    game = active_games.get(game_key)
-    if not game:
-        await update.message.reply_text("❌ Partie expirée.")
-        return
+    amount = context.user_data.get("roulette_amount") or game["amount"]
 
+    # Tirage
     spin = random.randint(0, 36)
     RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
     spin_color = "🔴" if spin in RED else ("⚫" if spin != 0 else "🟢")
@@ -619,8 +629,12 @@ async def roulette_number_input(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception:
         await update.message.reply_text("❌ Impossible de mettre à jour le message.")
+
+    # Nettoyage
     active_games.pop(game_key, None)
-    context.user_data.pop("roulette_numero", None)
+    context.user_data.pop("roulette_awaiting", None)
+    context.user_data.pop("roulette_game_key", None)
+    context.user_data.pop("roulette_amount", None)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. CRASH (interactif)

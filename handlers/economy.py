@@ -9,7 +9,8 @@ from telegram.ext import ContextTypes
 
 from database import (
     DB_PATH, get_user, update_balance, update_field, increment_field,
-    get_top_rich, add_life_journal, get_user_company
+    get_top_rich, add_life_journal, get_user_company,
+    transfer_money, debit_balance, db_connection
 )
 from utils.decorators import require_registered, require_free, cooldown
 from utils.helpers import fmt, fmt_time, now, parse_amount, get_karma_multiplier
@@ -71,13 +72,13 @@ async def cmd_quotidien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lifestyle = penalties["score"]
 
     await update_balance(user.id, amount)
-    await on_wealth_gain(user.id, amount)   # ← AJOUT
+    await on_wealth_gain(user.id, amount)
     await update_field(user.id, "daily_last", now())
-    await increment_field(user.id, "xp", 30)  # réduit de 50 à 30
+    await increment_field(user.id, "xp", 30)
     await on_xp_gain(user.id, 30)
 
-    await update_field(user.id, "hunger", min(100, u.get("hunger", 100) + 15))  # réduit de 20 à 15
-    await update_field(user.id, "happiness", min(100, u.get("happiness", 100) + 3))  # réduit de 5 à 3
+    await update_field(user.id, "hunger", min(100, u.get("hunger", 100) + 15))
+    await update_field(user.id, "happiness", min(100, u.get("happiness", 100) + 3))
     if lifestyle < 35:
         await update_field(user.id, "stress", min(100, u.get("stress", 0) + 4))
     await add_life_journal(user.id, "revenu", f"Bonus quotidien encaissé : {fmt(amount)}.", severity="success")
@@ -150,21 +151,20 @@ async def cmd_travailler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_health = max(0, u.get("health", 100) - (4 if penalties["severe_combo"] else 0))
 
     await update_balance(user.id, amount)
-    await on_wealth_gain(user.id, amount)   # ← AJOUT
+    await on_wealth_gain(user.id, amount)
     await update_field(user.id, "work_last", now())
     await update_field(user.id, "energy", new_energy)
     await update_field(user.id, "stress", new_stress)
     await update_field(user.id, "hunger", new_hunger)
     await update_field(user.id, "health", new_health)
     await increment_field(user.id, "xp", job_data["xp"])
-    # ✅ Mise à jour de la mission "Travailler"
     await update_mission_progress(user.id, "work", 1)
     await on_xp_gain(user.id, job_data["xp"])
     await process_referral_progress(user.id, context.bot)
 
     company = await get_user_company(user.id)
     if company:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connection() as db:   # ← remplacement
             await db.execute(
                 "UPDATE company_members SET activity_score = activity_score + 1 "
                 "WHERE user_id=? AND company_id=?",
@@ -384,7 +384,7 @@ async def cmd_metier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Payer un autre joueur (avec taxe sur gros montants)
+# Payer un autre joueur (avec taxe sur gros montants) – VERSION CORRIGÉE
 # ─────────────────────────────────────────────────────────────────────────────
 @require_registered
 async def cmd_payer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,22 +419,21 @@ async def cmd_payer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Taxe sur les gros transferts (1% au-delà de 100k)
-    tax = 0
-    if amount > 100_000:
-        tax = int(amount * 0.01)
-        amount_after_tax = amount - tax
-        await update_balance(user.id, -amount)  # débiter le montant total
-        await update_balance(target.id, amount_after_tax)
-        await on_wealth_gain(user.id, amount)   # ← AJOUT
-        await add_life_journal(user.id, "taxe", f"Taxe de 1% sur transfert de {fmt(amount)} : {fmt(tax)} prélevé.", severity="warning")
-    else:
-        await update_balance(user.id, -amount)
-        await update_balance(target.id, amount)
-        await on_wealth_gain(target.id, amount)   # ← AJOUT
-        await update_mission_progress(user.id, "pay", 1)
+    tax = int(amount * 0.01) if amount > 100_000 else 0
 
+    # Transfert atomique
+    ok = await transfer_money(user.id, target.id, amount, tax=tax)
+    if not ok:
+        await update.message.reply_text(f"❌ Fonds insuffisants ! Solde : {fmt(u['balance'])}")
+        return
+
+    # Mises à jour annexes
+    await on_wealth_gain(target.id, amount - tax)
+    await update_mission_progress(user.id, "pay", 1)
     if amount >= 100_000:
-        await increment_field(user.id, "karma", 1)  # karma réduit pour les gros paiements
+        await increment_field(user.id, "karma", 1)
+    if tax > 0:
+        await add_life_journal(user.id, "taxe", f"Taxe de 1% sur transfert de {fmt(amount)} : {fmt(tax)} prélevé.", severity="warning")
 
     msg = f"💸 **Transfert réussi !**\n\n"
     msg += f"👤 De : {user.full_name}\n"
@@ -447,14 +446,14 @@ async def cmd_payer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Compte et impôts (inchangé)
+# Compte et impôts (avec db_connection)
 # ─────────────────────────────────────────────────────────────────────────────
 @require_registered
 async def cmd_compte(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     u = await get_user(user.id)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connection() as db:
         async with db.execute("SELECT SUM(balance), SUM(loan) FROM bank_accounts WHERE user_id=?", (user.id,)) as cur:
             row = await cur.fetchone()
     bank_total = row[0] or 0
@@ -514,11 +513,11 @@ def _get_impots_rate(balance: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPÔTS QUOTIDIENS RENFORCÉS (appelé par le scheduler)
+# IMPÔTS QUOTIDIENS RENFORCÉS (appelé par le scheduler) – version corrigée
 # ─────────────────────────────────────────────────────────────────────────────
 async def process_daily_tax():
     """Prélève l'impôt progressif quotidien sur la fortune des joueurs (version renforcée)."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connection() as db:
         async with db.execute("SELECT user_id, balance FROM users WHERE registered=1 AND banned=0") as cur:
             users = await cur.fetchall()
         for uid, balance in users:
@@ -539,8 +538,8 @@ async def process_daily_tax():
                 continue
             tax = int(balance * rate / 100 / 30)   # quotidien = taux mensuel / 30
             if tax > 0:
-                await update_balance(uid, -tax)
-                if tax > 1000:
+                ok = await debit_balance(uid, tax)
+                if ok and tax > 1000:
                     await add_life_journal(uid, "impots", f"Impôt quotidien : {fmt(tax)} prélevé.", severity="warning")
         logger.info("💰 Impôts quotidiens prélevés (taux renforcés).")
 
@@ -807,14 +806,18 @@ async def cmd_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount > 50_000:
         tax = int(amount * 0.01)
         amount_after_tax = amount - tax
-        await update_balance(sender.id, -amount)
-        await update_balance(target.id, amount_after_tax)
-        await on_wealth_gain(target.id, amount)   # ← AJOUT
+        ok = await transfer_money(sender.id, target.id, amount, tax=tax)
+        if not ok:
+            await update.message.reply_text(f"❌ Erreur de transfert, vérifie ton solde.")
+            return
     else:
-        await update_balance(sender.id, -amount)
-        await update_balance(target.id, amount)
-        await on_wealth_gain(target.id, amount)   # ← AJOUT
+        ok = await transfer_money(sender.id, target.id, amount, tax=0)
+        if not ok:
+            await update.message.reply_text(f"❌ Erreur de transfert, vérifie ton solde.")
+            return
         amount_after_tax = amount
+
+    await on_wealth_gain(target.id, amount_after_tax)   # déjà fait par transfer_money mais gardé pour cohérence
 
     karma_gain = max(1, amount_after_tax // 5_000)
     karma_gain = min(50, karma_gain)
