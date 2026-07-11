@@ -72,6 +72,102 @@ async def db_connection(row_factory=None):
     finally:
         await _DB_POOL.release(db)
 
+# ═══════════════════ ARGENT ATOMIQUE ═══════════════════
+class InsufficientFunds(Exception):
+    pass
+
+
+async def debit_balance(user_id: int, amount: int) -> bool:
+    if amount <= 0:
+        raise ValueError("Le montant à débiter doit être positif")
+    async with db_connection() as db:
+        cur = await db.execute(
+            "UPDATE users SET balance = balance - ? "
+            "WHERE user_id = ? AND balance >= ?",
+            (amount, user_id, amount),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def credit_balance(user_id: int, amount: int) -> None:
+    if amount <= 0:
+        raise ValueError("Le montant à créditer doit être positif")
+    async with db_connection() as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        await db.commit()
+
+
+async def transfer_money(from_id: int, to_id: int, amount: int, tax: int = 0) -> bool:
+    if amount <= 0:
+        raise ValueError("Le montant à transférer doit être positif")
+    if tax < 0 or tax >= amount:
+        raise ValueError("Taxe invalide")
+    async with db_connection() as db:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "UPDATE users SET balance = balance - ? "
+                "WHERE user_id = ? AND balance >= ?",
+                (amount, from_id, amount),
+            )
+            if cur.rowcount == 0:
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                (amount - tax, to_id),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            await db.rollback()
+            raise
+
+
+# ═══════════════════ MIGRATIONS ═══════════════════
+MIGRATIONS = [
+    # (1, ["ALTER TABLE users ADD COLUMN vip_until INTEGER DEFAULT 0"]),
+]
+
+
+async def _column_exists(db, table: str, column: str) -> bool:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        cols = await cur.fetchall()
+    return any(c[1] == column for c in cols)
+
+
+async def run_migrations():
+    async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT) as db:
+        await _configure_connection(db)
+        async with db.execute("PRAGMA user_version") as cur:
+            row = await cur.fetchone()
+        current = row[0] if row else 0
+        target = max((v for v, _ in MIGRATIONS), default=0)
+        if current >= target:
+            logger.info("✅ DB à jour (version %s).", current)
+            return
+        for version, statements in sorted(MIGRATIONS, key=lambda m: m[0]):
+            if version <= current:
+                continue
+            logger.info("🔄 Migration vers la version %s...", version)
+            try:
+                await db.execute("BEGIN")
+                for sql in statements:
+                    await db.execute(sql)
+                await db.execute(f"PRAGMA user_version = {version}")
+                await db.commit()
+                logger.info("✅ Migration %s appliquée.", version)
+            except Exception:
+                await db.rollback()
+                logger.exception("❌ Échec de la migration %s, annulée.", version)
+                raise
+
+# ─── Le reste du fichier (inchangé, sauf la suppression des doubles CREATE TABLE contracts) ───
+
 ALLOWED_FIELDS = {
     "username", "balance", "xp", "level", "karma", "prestige", "health",
     "energy", "happiness", "hunger", "stress", "age", "diplome", "job",
@@ -370,6 +466,8 @@ async def init_db():
             PRIMARY KEY (user_id, company_id)
         )""")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_company_shares_company ON company_shares(company_id)")
+
+        # -------- Table company_contracts (version enrichie) --------
         await db.execute("""
         CREATE TABLE IF NOT EXISTS company_contracts (
             contract_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -380,16 +478,22 @@ async def init_db():
             status       TEXT DEFAULT 'pending',
             proposed_at  INTEGER NOT NULL
         )""")
+
+        # -------- Table contracts (version enrichie, avec accepted_at et end_date) --------
         await db.execute("""
         CREATE TABLE IF NOT EXISTS contracts (
             contract_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_company INTEGER,
-            to_company   INTEGER,
-            amount       INTEGER,
-            duration     INTEGER,
-            status       TEXT DEFAULT 'pending',
-            created_at   INTEGER
+            from_company INTEGER NOT NULL,
+            to_company INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            duration INTEGER NOT NULL,         -- en jours
+            contract_type TEXT DEFAULT 'service',
+            status TEXT DEFAULT 'pending',
+            proposed_at INTEGER NOT NULL,
+            accepted_at INTEGER DEFAULT 0,
+            end_date INTEGER DEFAULT 0
         )""")
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS company_products (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -438,21 +542,6 @@ async def init_db():
             status TEXT DEFAULT 'pending',
             created_at INTEGER NOT NULL,
             responded_at INTEGER DEFAULT 0
-        )""")
-
-        # Contrats (enrichis)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS contracts (
-            contract_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_company INTEGER NOT NULL,
-            to_company INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            duration INTEGER NOT NULL,         -- en jours
-            contract_type TEXT DEFAULT 'service',
-            status TEXT DEFAULT 'pending',
-            proposed_at INTEGER NOT NULL,
-            accepted_at INTEGER DEFAULT 0,
-            end_date INTEGER DEFAULT 0
         )""")
 
         # ---------- Table family ----------

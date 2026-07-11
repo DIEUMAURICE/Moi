@@ -26,10 +26,10 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN, ADMIN_IDS
-from database import init_db, DB_PATH, now
+from database import init_db, DB_PATH, now, run_migrations  # ← AJOUT run_migrations
+from utils.error_handler import error_handler          # ← AJOUT
 
 # ─── Handlers existants ─────────────────────────────────────────────
-from utils.error_handler import error_handler
 from handlers.legacy import cmd_legacy, cmd_reincarnate
 from handlers.general import (
     cmd_start, cmd_aide, cmd_menu, cmd_nouveautes, menu_callback,
@@ -89,11 +89,10 @@ from handlers.family import (
 )
 from handlers.travel import cmd_destinations, cmd_voyager, cmd_monstimbre
 # ── Vehicles (ancien, pour achats/ventes) ─────────────────────────
-# ── Vehicles (ancien, pour achats/ventes) ─────────────────────────
 from handlers.vehicle import (
     cmd_vehicules_liste, cmd_acheter_vehicule, cmd_mes_vehicules,
     cmd_reparer_vehicule, cmd_assurer_vehicule, cmd_vendre_vehicule,
-    cmd_vehicule_info,  # ← AJOUTER
+    cmd_vehicule_info,
 )
 # ── Vehicles 2.0 (nouveau, garage, réparation, carburant) ────────
 from handlers.vehicles import (
@@ -345,7 +344,11 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(mines_callback, pattern=r"^mines_"))
     app.add_handler(CallbackQueryHandler(pmu_callback, pattern=r"^pmu_"))
     app.add_handler(CommandHandler("casino", cmd_casino))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, roulette_number_input))
+    # Correction du handler roulette avec group=10
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, roulette_number_input),
+        group=10,
+    )
 
     # ── Investments (bourse) ────────────────────────────────────────
     inv_cmds = {
@@ -383,7 +386,7 @@ def build_app() -> Application:
     for c, h in [("vehicules", cmd_vehicules_liste), ("acheterv", cmd_acheter_vehicule),
              ("mesvehicules", cmd_mes_vehicules), ("reparer", cmd_reparer_vehicule),
              ("assurerv", cmd_assurer_vehicule), ("vendrevehicule", cmd_vendre_vehicule),
-             ("vehicule_info", cmd_vehicule_info)]:  # ← AJOUTER
+             ("vehicule_info", cmd_vehicule_info)]:
         app.add_handler(CommandHandler(c, h))
 
     # ── Vehicles 2.0 (garage, repair, refuel) ───────────────────────
@@ -724,7 +727,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(market_page_callback, pattern=r"^market_page_"))
 
     # ── Callbacks divers ────────────────────────────────────────────
-    app.add_error_handler(error_handler)
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^(report_|admin_report_)"))
     app.add_handler(CallbackQueryHandler(challenge_callback, pattern=r"^challenge_"))
     app.add_handler(CallbackQueryHandler(rps_callback, pattern=r"^rps\|"))
@@ -739,6 +741,9 @@ def build_app() -> Application:
 
     # ── Catch-all commande inconnue ─────────────────────────────────
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown_command))
+
+    # ── Gestionnaire d'erreur global ───────────────────────────────
+    app.add_error_handler(error_handler)
 
     return app
 
@@ -878,6 +883,7 @@ async def expire_old_trades():
 # ═══════════════════════════════════════════════════════════════════
 async def main():
     await init_db()
+    await run_migrations()   # ← AJOUT
     await init_mp_tables()
     logger.info("✅ Base de données initialisée (avec tables MP, guildes, véhicules 2.0).")
     app = build_app()
